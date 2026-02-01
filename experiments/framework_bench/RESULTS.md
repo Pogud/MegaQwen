@@ -10,21 +10,31 @@
 - Decode tokens per prompt: 100
 - Temperature: 0.0 (greedy)
 
-## Results
+## Throughput Results
 
 | Framework | TTFT (s) | Decode tok/s | Peak Memory | Speedup vs HF |
 |-----------|----------|--------------|-------------|---------------|
 | HuggingFace | 0.071 | 81 | 1.4 GB | 1.0x |
 | **Megakernel** | **0.004** | **239** | 2.6 GB | **2.95x** |
-| vLLM | - | - | - | OOM (needs isolated run) |
+| vLLM | 0.047 | 107 | ~2.0 GB | 1.32x |
 | SGLang | - | - | - | Requires server |
 | llama.cpp | - | - | - | Needs GGUF conversion |
+
+## Power & Energy Efficiency
+
+| Framework | Idle (W) | Avg (W) | Peak (W) | tok/s | tok/J | Efficiency vs HF |
+|-----------|----------|---------|----------|-------|-------|------------------|
+| HuggingFace | 169.1 | 185.3 | 190.2 | 58.4 | 0.31 | 1.0x |
+| **Megakernel** | 172.1 | 200.2 | 228.3 | 156.6 | **0.78** | **2.48x** |
+| vLLM | 170.8 | 195.4 | 208.8 | 107.3 | 0.55 | 1.74x |
 
 ## Key Findings
 
 1. **Megakernel is 2.95x faster than HuggingFace** for decode throughput
-2. **TTFT is 17.75x faster** (4ms vs 71ms) due to fused kernel launch
-3. Memory usage is higher for megakernel (2.6 GB vs 1.4 GB) due to:
+2. **Megakernel is 2.48x more energy efficient** (0.78 tok/J vs 0.31 tok/J)
+3. **TTFT is 17.75x faster** (4ms vs 71ms) due to fused kernel launch
+4. vLLM achieves 1.74x energy efficiency over HuggingFace
+5. Memory usage is higher for megakernel (2.6 GB vs 1.4 GB) due to:
    - Pre-allocated intermediate buffers
    - Full KV cache allocation upfront
 
@@ -50,7 +60,7 @@ python experiments/framework_bench/quality_metrics.py
 
 ## TODO
 
-- [ ] Run vLLM in isolated process (OOM with other models loaded)
+- [x] Run vLLM in isolated process (OOM with other models loaded)
 - [ ] Convert model to GGUF for llama.cpp/Ollama
 - [ ] Set up SGLang server for comparison
 - [ ] Add TensorRT-LLM benchmark
