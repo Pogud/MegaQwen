@@ -418,6 +418,124 @@ class MegakernelChat:
 
         return response
 
+    def generate_stream(self, prompt: str, max_new_tokens: int = 500):
+        """Generate response with streaming output."""
+        import sys
+
+        # Reset KV cache
+        self.k_cache.zero_()
+        self.v_cache.zero_()
+
+        # Tokenize
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+        input_ids = inputs["input_ids"][0].tolist()
+        prompt_len = len(input_ids)
+
+        if prompt_len >= MAX_SEQ_LEN - max_new_tokens:
+            input_ids = input_ids[-(MAX_SEQ_LEN - max_new_tokens - 1):]
+            prompt_len = len(input_ids)
+
+        total_start = time.perf_counter()
+
+        # Prefill
+        prefill_start = time.perf_counter()
+        first_generated_token = None
+        for position, token_id in enumerate(input_ids):
+            cache_len = position + 1
+            output_token = self.kernel.decode_ldg(
+                token_id,
+                self.final_norm_weight,
+                self.lm_head_weight,
+                self.cos_table.contiguous(),
+                self.sin_table.contiguous(),
+                self.k_cache.contiguous(),
+                self.v_cache.contiguous(),
+                self.hidden_buffer,
+                self.g_activations,
+                self.g_residual,
+                self.g_q,
+                self.g_k,
+                self.g_v,
+                self.g_attn_out,
+                self.g_mlp_intermediate,
+                self.g_normalized,
+                self.block_max_vals,
+                self.block_max_idxs,
+                NUM_LAYERS,
+                position,
+                cache_len,
+                MAX_SEQ_LEN,
+            )
+            first_generated_token = output_token
+        prefill_time = time.perf_counter() - prefill_start
+
+        current_token = first_generated_token
+        generated_tokens = [current_token]
+
+        # Stream first token
+        token_str = self.tokenizer.decode([current_token], skip_special_tokens=True)
+        print(token_str, end="", flush=True)
+
+        if current_token == self.tokenizer.eos_token_id:
+            total_time = time.perf_counter() - total_start
+            print(f"\n[prefill: {prompt_len} tok @ {prompt_len/prefill_time:.0f} tok/s | decode: 1 tok | total: {total_time*1000:.0f}ms]")
+            return self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+
+        # Decode with streaming
+        decode_start = time.perf_counter()
+
+        for i in range(max_new_tokens - 1):
+            position = prompt_len + i
+            cache_len = position + 1
+
+            next_token = self.kernel.decode_ldg(
+                current_token,
+                self.final_norm_weight,
+                self.lm_head_weight,
+                self.cos_table.contiguous(),
+                self.sin_table.contiguous(),
+                self.k_cache.contiguous(),
+                self.v_cache.contiguous(),
+                self.hidden_buffer,
+                self.g_activations,
+                self.g_residual,
+                self.g_q,
+                self.g_k,
+                self.g_v,
+                self.g_attn_out,
+                self.g_mlp_intermediate,
+                self.g_normalized,
+                self.block_max_vals,
+                self.block_max_idxs,
+                NUM_LAYERS,
+                position,
+                cache_len,
+                MAX_SEQ_LEN,
+            )
+
+            generated_tokens.append(next_token)
+
+            # Stream token
+            token_str = self.tokenizer.decode([next_token], skip_special_tokens=True)
+            print(token_str, end="", flush=True)
+
+            current_token = next_token
+
+            if next_token == self.tokenizer.eos_token_id:
+                break
+
+        decode_time = time.perf_counter() - decode_start
+        total_time = time.perf_counter() - total_start
+
+        num_generated = len(generated_tokens)
+        prefill_tps = prompt_len / prefill_time if prefill_time > 0 else 0
+        decode_tps = num_generated / decode_time if decode_time > 0 else 0
+        print(f"\n[prefill: {prompt_len} tok @ {prefill_tps:.0f} tok/s | "
+              f"decode: {num_generated} tok @ {decode_tps:.0f} tok/s | "
+              f"total: {total_time*1000:.0f}ms]")
+
+        return self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+
     def chat(self):
         """Interactive chat loop."""
         print("\n" + "="*60)
@@ -464,9 +582,9 @@ class MegakernelChat:
             # Debug: show prompt (uncomment to debug)
             # print(f"\n[DEBUG] Prompt ({len(self.tokenizer.encode(prompt))} tokens):\n{prompt}\n")
 
-            # Generate
+            # Generate with streaming
             print("Assistant: ", end="", flush=True)
-            response = self.generate(prompt, max_new_tokens=200, show_speed=True)
+            response = self.generate_stream(prompt, max_new_tokens=500)
 
             # Clean up response
             response = response.split("<|im_end|>")[0].strip()
