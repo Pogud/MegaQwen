@@ -81,6 +81,37 @@ extern "C" void launch_ldg_decode(
     cudaStream_t stream
 );
 
+extern "C" void launch_ldg_decode_with_logits(
+    int input_token_id,
+    int* output_token_id,
+    float* logits_output,
+    const void* embed_weight,
+    const LDGLayerWeights* layer_weights,
+    const void* final_norm_weight,
+    const void* lm_head_weight,
+    const void* cos_table,
+    const void* sin_table,
+    void* k_cache,
+    void* v_cache,
+    void* hidden_buffer,
+    void* g_activations,
+    void* g_residual,
+    void* g_q,
+    void* g_k,
+    void* g_v,
+    void* g_attn_out,
+    void* g_mlp_intermediate,
+    void* g_normalized,
+    void* block_max_vals,
+    void* block_max_idxs,
+    int num_layers,
+    int position,
+    int cache_len,
+    int max_seq_len,
+    float attn_scale,
+    cudaStream_t stream
+);
+
 static std::vector<LDGLayerWeights> g_layer_weights;
 static LDGLayerWeights* d_layer_weights = nullptr;
 static torch::Tensor d_embed_weight;
@@ -188,10 +219,75 @@ int decode_ldg(
     return output_token.item<int>();
 }
 
+std::tuple<int, torch::Tensor> decode_ldg_with_logits(
+    int input_token_id,
+    torch::Tensor final_norm_weight,
+    torch::Tensor lm_head_weight,
+    torch::Tensor cos_table,
+    torch::Tensor sin_table,
+    torch::Tensor k_cache,
+    torch::Tensor v_cache,
+    torch::Tensor hidden_buffer,
+    torch::Tensor g_activations,
+    torch::Tensor g_residual,
+    torch::Tensor g_q,
+    torch::Tensor g_k,
+    torch::Tensor g_v,
+    torch::Tensor g_attn_out,
+    torch::Tensor g_mlp_intermediate,
+    torch::Tensor g_normalized,
+    torch::Tensor block_max_vals,
+    torch::Tensor block_max_idxs,
+    int num_layers,
+    int position,
+    int cache_len,
+    int max_seq_len
+) {
+    float attn_scale = 1.0f / sqrtf(128.0f);
+    auto output_token = torch::empty({1}, torch::dtype(torch::kInt32).device(k_cache.device()));
+    auto logits = torch::empty({151936}, torch::dtype(torch::kFloat32).device(k_cache.device()));
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+
+    launch_ldg_decode_with_logits(
+        input_token_id,
+        output_token.data_ptr<int>(),
+        logits.data_ptr<float>(),
+        d_embed_weight.data_ptr(),
+        d_layer_weights,
+        final_norm_weight.data_ptr(),
+        lm_head_weight.data_ptr(),
+        cos_table.data_ptr(),
+        sin_table.data_ptr(),
+        k_cache.data_ptr(),
+        v_cache.data_ptr(),
+        hidden_buffer.data_ptr(),
+        g_activations.data_ptr(),
+        g_residual.data_ptr(),
+        g_q.data_ptr(),
+        g_k.data_ptr(),
+        g_v.data_ptr(),
+        g_attn_out.data_ptr(),
+        g_mlp_intermediate.data_ptr(),
+        g_normalized.data_ptr(),
+        block_max_vals.data_ptr(),
+        block_max_idxs.data_ptr(),
+        num_layers,
+        position,
+        cache_len,
+        max_seq_len,
+        attn_scale,
+        stream
+    );
+
+    cudaStreamSynchronize(stream);
+    return std::make_tuple(output_token.item<int>(), logits);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("init_ldg_layer_weights", &init_ldg_layer_weights);
     m.def("init_ldg_embed_weight", &init_ldg_embed_weight);
     m.def("decode_ldg", &decode_ldg);
+    m.def("decode_ldg_with_logits", &decode_ldg_with_logits);
 }
 """
 

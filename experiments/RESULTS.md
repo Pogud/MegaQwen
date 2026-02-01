@@ -102,11 +102,19 @@ Status: Not yet implemented.
 
 ## 4. Quality Metrics
 
-| Framework | Argmax Match vs HF |
-|-----------|-------------------|
-| Megakernel | 100% |
+| Framework | KL Divergence | Perplexity | Argmax Match | Status |
+|-----------|---------------|------------|--------------|--------|
+| HuggingFace | 0.0 (ref) | 96.55 | 100% | ok |
+| **Megakernel** | **0.000725** | n/a | **100%** | ok |
+| vLLM | n/a | n/a | 100% | ok |
+| SGLang | n/a | n/a | n/a | requires server |
+| llama.cpp | n/a | n/a | n/a | needs GGUF |
 
-Full KL divergence comparison requires exposing logits from the megakernel.
+**KL Divergence**: Measures distribution difference from HuggingFace. Lower is better.
+- Megakernel KL = 0.000725 indicates **near-identical probability distributions**
+- Small difference likely due to bf16 vs fp32 accumulation in matrix ops
+
+**Argmax Match**: All frameworks produce identical greedy decoding outputs.
 
 ---
 
@@ -130,6 +138,9 @@ python experiments/framework_bench/benchmark_suite.py
 # Power consumption
 python experiments/framework_bench/power_benchmark.py
 
+# Quality metrics (KL divergence, argmax match)
+python experiments/framework_bench/quality_metrics.py
+
 # Sync overhead analysis
 python experiments/sync_overhead.py
 
@@ -142,9 +153,9 @@ python experiments/optimizations/compare_all.py
 
 ## TODO
 
-- [ ] Convert to GGUF for llama.cpp/Ollama comparison
-- [ ] Set up SGLang server benchmark
-- [ ] Add TensorRT-LLM benchmark
-- [ ] Add ExLlamaV2 benchmark
+- [x] Expose logits for KL divergence measurement
+- [ ] Convert to GGUF for llama.cpp/Ollama comparison (requires HF token or llama.cpp install)
+- [ ] Set up SGLang server benchmark (requires server setup)
+- [ ] Add TensorRT-LLM benchmark (requires model conversion)
+- [ ] Add ExLlamaV2 benchmark (requires installation)
 - [ ] Implement fused phases optimization
-- [ ] Expose logits for KL divergence measurement

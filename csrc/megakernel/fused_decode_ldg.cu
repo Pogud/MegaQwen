@@ -663,6 +663,48 @@ ldg_decode_kernel(
 // LM Head (same structure)
 // =============================================================================
 
+// Kernel to compute full logits (for KL divergence measurement)
+__global__ void ldg_lm_head_logits(
+    const float* __restrict__ hidden,
+    const __nv_bfloat16* __restrict__ weight,
+    float* __restrict__ logits
+) {
+    __shared__ float s_hidden[HIDDEN_SIZE];
+
+    for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_LM_BLOCK_SIZE) {
+        s_hidden[i] = hidden[i];
+    }
+    __syncthreads();
+
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+
+    int rows_per_block = (LDG_VOCAB_SIZE + gridDim.x - 1) / gridDim.x;
+    int row_start = blockIdx.x * rows_per_block;
+    int row_end = min(row_start + rows_per_block, LDG_VOCAB_SIZE);
+
+    for (int m = row_start + warp_id; m < row_end; m += LDG_LM_BLOCK_SIZE / WARP_SIZE) {
+        const __nv_bfloat16* w_row = weight + m * HIDDEN_SIZE;
+
+        float sum = 0.0f;
+        #pragma unroll 8
+        for (int k = lane_id * 4; k < HIDDEN_SIZE; k += WARP_SIZE * 4) {
+            uint2 w_u2 = __ldg(reinterpret_cast<const uint2*>(w_row + k));
+            __nv_bfloat16* w_ptr = reinterpret_cast<__nv_bfloat16*>(&w_u2);
+
+            sum += __bfloat162float(w_ptr[0]) * s_hidden[k] +
+                   __bfloat162float(w_ptr[1]) * s_hidden[k+1] +
+                   __bfloat162float(w_ptr[2]) * s_hidden[k+2] +
+                   __bfloat162float(w_ptr[3]) * s_hidden[k+3];
+        }
+        sum = ldg_warp_reduce_sum(sum);
+
+        if (lane_id == 0) {
+            logits[m] = sum;
+        }
+    }
+}
+
 __global__ void ldg_lm_head_phase1(
     const float* __restrict__ hidden,
     const __nv_bfloat16* __restrict__ weight,
@@ -848,6 +890,94 @@ extern "C" void launch_ldg_decode(
         stream
     );
 
+    ldg_lm_head_phase1<<<LDG_LM_NUM_BLOCKS, LDG_LM_BLOCK_SIZE, 0, stream>>>(
+        (const float*)g_normalized,
+        (const __nv_bfloat16*)lm_head_weight,
+        (float*)block_max_vals,
+        (int*)block_max_idxs
+    );
+
+    ldg_lm_head_phase2<<<1, 256, 0, stream>>>(
+        (const float*)block_max_vals,
+        (const int*)block_max_idxs,
+        output_token_id,
+        LDG_LM_NUM_BLOCKS
+    );
+}
+
+// Launch function that also outputs full logits (for KL divergence)
+extern "C" void launch_ldg_decode_with_logits(
+    int input_token_id,
+    int* output_token_id,
+    float* logits_output,
+    const void* embed_weight,
+    const LDGLayerWeights* layer_weights,
+    const void* final_norm_weight,
+    const void* lm_head_weight,
+    const void* cos_table,
+    const void* sin_table,
+    void* k_cache,
+    void* v_cache,
+    void* hidden_buffer,
+    void* g_activations,
+    void* g_residual,
+    void* g_q,
+    void* g_k,
+    void* g_v,
+    void* g_attn_out,
+    void* g_mlp_intermediate,
+    void* g_normalized,
+    void* block_max_vals,
+    void* block_max_idxs,
+    int num_layers,
+    int position,
+    int cache_len,
+    int max_seq_len,
+    float attn_scale,
+    cudaStream_t stream
+) {
+    void* kernel_args[] = {
+        (void*)&input_token_id,
+        (void*)&embed_weight,
+        (void*)&layer_weights,
+        (void*)&final_norm_weight,
+        (void*)&cos_table,
+        (void*)&sin_table,
+        (void*)&k_cache,
+        (void*)&v_cache,
+        (void*)&hidden_buffer,
+        (void*)&g_activations,
+        (void*)&g_residual,
+        (void*)&g_q,
+        (void*)&g_k,
+        (void*)&g_v,
+        (void*)&g_attn_out,
+        (void*)&g_mlp_intermediate,
+        (void*)&g_normalized,
+        (void*)&num_layers,
+        (void*)&position,
+        (void*)&cache_len,
+        (void*)&max_seq_len,
+        (void*)&attn_scale
+    };
+
+    cudaLaunchCooperativeKernel(
+        (void*)ldg_decode_kernel,
+        dim3(LDG_NUM_BLOCKS),
+        dim3(LDG_BLOCK_SIZE),
+        kernel_args,
+        0,
+        stream
+    );
+
+    // Compute full logits
+    ldg_lm_head_logits<<<LDG_LM_NUM_BLOCKS, LDG_LM_BLOCK_SIZE, 0, stream>>>(
+        (const float*)g_normalized,
+        (const __nv_bfloat16*)lm_head_weight,
+        logits_output
+    );
+
+    // Also compute argmax for the token output
     ldg_lm_head_phase1<<<LDG_LM_NUM_BLOCKS, LDG_LM_BLOCK_SIZE, 0, stream>>>(
         (const float*)g_normalized,
         (const __nv_bfloat16*)lm_head_weight,
