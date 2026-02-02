@@ -61,10 +61,38 @@ python benchmark_suite.py
 python verify_correctness.py
 ```
 
+## Key Findings
+
+After exhaustive optimization, we discovered the kernel is **latency-bound by synchronization, not memory bandwidth**:
+
+- **5% memory bandwidth utilization** (47 GB/s effective vs 936 GB/s peak)
+- **140+ `grid.sync()` calls** per token at ~0.7us each = ~100us sync overhead
+- **~530 tok/s is the architectural ceiling** for batch=1 bf16 cooperative megakernels on RTX 3090
+
+### What Worked
+
+| Optimization | Impact |
+|--------------|--------|
+| Block divergence + L2 prefetch | **+2x** |
+| 128-bit vectorized loads | +3.5% |
+
+### What Didn't Work
+
+| Optimization | Impact | Why |
+|--------------|--------|-----|
+| Warp producer/consumer split | 0% | Reduces compute parallelism |
+| Shared memory caching | 0% | L1/L2 already effective |
+| cp.async double-buffering | +1% | Can't overlap enough compute |
+
+See [DEVLOG.md](DEVLOG.md) for the complete optimization journey.
+
 ## Documentation
 
-- [Architecture & Technical Details](docs/ARCHITECTURE.md)
-- [Technical Specification](SPEC.md)
+- **[Development Log](DEVLOG.md)** - Complete optimization journey and learnings
+- [Benchmark Results](experiments/RESULTS.md) - Full benchmark data
+- [Memory Analysis](docs/MEMORY_ANALYSIS.md) - Bandwidth and SASS analysis
+- [Architecture](docs/ARCHITECTURE.md) - Kernel architecture details
+- [Specification](SPEC.md) - Technical specification
 
 ## License
 
