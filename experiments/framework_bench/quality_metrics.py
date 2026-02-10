@@ -170,7 +170,6 @@ def get_megakernel_logits(prompts: List[str], ref_logits: List[torch.Tensor], re
         tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, local_files_only=True)
 
         total_kl = 0.0
-        total_ppl = 0.0
         matches = 0
         total = 0
 
@@ -304,8 +303,6 @@ def get_sglang_logits(prompts: List[str], ref_logits: List[torch.Tensor], ref_in
     clear_gpu_memory()
 
     try:
-        import sglang as sgl
-        from sglang import RuntimeEndpoint
 
         print("Starting SGLang server...")
         # SGLang requires running a server, which is complex for a benchmark

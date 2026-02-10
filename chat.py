@@ -14,6 +14,36 @@ HEAD_DIM = 128
 INTERMEDIATE_SIZE = 3072
 MAX_SEQ_LEN = 512
 
+SUPPORTED_DECODE_KERNEL_VARIANTS = ("baseline", "fastmath", "blocks128_fastmath")
+AUTO_KERNEL_VARIANT = "auto"
+SHORT_DECODE_TOKEN_THRESHOLD = 128
+
+
+def select_optimal_kernel_variant(max_new_tokens: int) -> str:
+    """Return the best decode-kernel variant for a generation length."""
+    if max_new_tokens <= 0:
+        raise ValueError("max_new_tokens must be positive")
+
+    if max_new_tokens <= SHORT_DECODE_TOKEN_THRESHOLD:
+        return "fastmath"
+    return "blocks128_fastmath"
+
+
+def _sanitize_variant_for_module_name(variant: str) -> str:
+    return "".join(ch if ch.isalnum() else "_" for ch in variant)
+
+
+def _get_decode_kernel_source(variant: str) -> str:
+    kernel_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc", "megakernel")
+
+    if variant == "baseline":
+        with open(os.path.join(kernel_dir, "fused_decode_ldg.cu")) as f:
+            return f.read()
+
+    from experimental.variant_sources import build_variant_source
+
+    return build_variant_source(variant)
+
 
 def precompute_rope_freqs(head_dim: int, max_seq_len: int, theta: float = 1000000.0, device="cuda"):
     inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim))
@@ -26,11 +56,13 @@ def precompute_rope_freqs(head_dim: int, max_seq_len: int, theta: float = 100000
     return cos, sin
 
 
-def compile_kernel():
-    kernel_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc", "megakernel")
+def compile_kernel(variant: str = "baseline"):
+    if variant not in SUPPORTED_DECODE_KERNEL_VARIANTS:
+        supported = ", ".join(SUPPORTED_DECODE_KERNEL_VARIANTS)
+        raise ValueError(f"unsupported kernel variant '{variant}', expected one of: {supported}")
 
-    with open(os.path.join(kernel_dir, "fused_decode_ldg.cu")) as f:
-        cuda_src = f.read()
+    kernel_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc", "megakernel")
+    cuda_src = _get_decode_kernel_source(variant)
 
     cpp_src = """
 #include <torch/extension.h>
@@ -291,8 +323,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 }
 """
 
+    safe_variant = _sanitize_variant_for_module_name(variant)
     module = load_inline(
-        name="ldg_kernel_chat",
+        name=f"ldg_kernel_chat_{safe_variant}",
         cpp_sources=[cpp_src],
         cuda_sources=[cuda_src],
         extra_cuda_cflags=[
@@ -323,56 +356,54 @@ def load_weights_from_hf():
 
 
 class MegakernelChat:
-    def __init__(self):
+    def __init__(self, kernel_variant: str = AUTO_KERNEL_VARIANT):
         self.device = "cuda"
+        supported = (AUTO_KERNEL_VARIANT, *SUPPORTED_DECODE_KERNEL_VARIANTS)
+        if kernel_variant not in supported:
+            raise ValueError(f"unsupported kernel variant '{kernel_variant}', expected one of: {', '.join(supported)}")
+
+        self.kernel_variant_mode = kernel_variant
+        self.kernel = None
+        self._kernel_cache = {}
+        self._active_kernel_variant = None
 
         print("Loading tokenizer...")
         self.tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B", local_files_only=True)
 
-        print("Compiling custom CUDA kernels...")
-        self.kernel = compile_kernel()
-
         print("Loading model weights...")
         state_dict = load_weights_from_hf()
 
-        input_layernorm_weights = []
-        q_proj_weights = []
-        k_proj_weights = []
-        v_proj_weights = []
-        q_norm_weights = []
-        k_norm_weights = []
-        o_proj_weights = []
-        post_attn_layernorm_weights = []
-        gate_proj_weights = []
-        up_proj_weights = []
-        down_proj_weights = []
+        # Keep references alive for C++ raw pointers.
+        self.input_layernorm_weights = []
+        self.q_proj_weights = []
+        self.k_proj_weights = []
+        self.v_proj_weights = []
+        self.q_norm_weights = []
+        self.k_norm_weights = []
+        self.o_proj_weights = []
+        self.post_attn_layernorm_weights = []
+        self.gate_proj_weights = []
+        self.up_proj_weights = []
+        self.down_proj_weights = []
 
         for i in range(NUM_LAYERS):
-            input_layernorm_weights.append(state_dict[f"model.layers.{i}.input_layernorm.weight"].contiguous())
-            q_proj_weights.append(state_dict[f"model.layers.{i}.self_attn.q_proj.weight"].contiguous())
-            k_proj_weights.append(state_dict[f"model.layers.{i}.self_attn.k_proj.weight"].contiguous())
-            v_proj_weights.append(state_dict[f"model.layers.{i}.self_attn.v_proj.weight"].contiguous())
-            q_norm_weights.append(state_dict[f"model.layers.{i}.self_attn.q_norm.weight"].contiguous())
-            k_norm_weights.append(state_dict[f"model.layers.{i}.self_attn.k_norm.weight"].contiguous())
-            o_proj_weights.append(state_dict[f"model.layers.{i}.self_attn.o_proj.weight"].contiguous())
-            post_attn_layernorm_weights.append(state_dict[f"model.layers.{i}.post_attention_layernorm.weight"].contiguous())
-            gate_proj_weights.append(state_dict[f"model.layers.{i}.mlp.gate_proj.weight"].contiguous())
-            up_proj_weights.append(state_dict[f"model.layers.{i}.mlp.up_proj.weight"].contiguous())
-            down_proj_weights.append(state_dict[f"model.layers.{i}.mlp.down_proj.weight"].contiguous())
+            self.input_layernorm_weights.append(state_dict[f"model.layers.{i}.input_layernorm.weight"].contiguous())
+            self.q_proj_weights.append(state_dict[f"model.layers.{i}.self_attn.q_proj.weight"].contiguous())
+            self.k_proj_weights.append(state_dict[f"model.layers.{i}.self_attn.k_proj.weight"].contiguous())
+            self.v_proj_weights.append(state_dict[f"model.layers.{i}.self_attn.v_proj.weight"].contiguous())
+            self.q_norm_weights.append(state_dict[f"model.layers.{i}.self_attn.q_norm.weight"].contiguous())
+            self.k_norm_weights.append(state_dict[f"model.layers.{i}.self_attn.k_norm.weight"].contiguous())
+            self.o_proj_weights.append(state_dict[f"model.layers.{i}.self_attn.o_proj.weight"].contiguous())
+            self.post_attn_layernorm_weights.append(state_dict[f"model.layers.{i}.post_attention_layernorm.weight"].contiguous())
+            self.gate_proj_weights.append(state_dict[f"model.layers.{i}.mlp.gate_proj.weight"].contiguous())
+            self.up_proj_weights.append(state_dict[f"model.layers.{i}.mlp.up_proj.weight"].contiguous())
+            self.down_proj_weights.append(state_dict[f"model.layers.{i}.mlp.down_proj.weight"].contiguous())
 
         self.final_norm_weight = state_dict["model.norm.weight"].contiguous()
         self.lm_head_weight = state_dict["lm_head.weight"].contiguous()
-        embed_weight = state_dict["model.embed_tokens.weight"].contiguous()
+        self.embed_weight = state_dict["model.embed_tokens.weight"].contiguous()
 
         self.cos_table, self.sin_table = precompute_rope_freqs(HEAD_DIM, MAX_SEQ_LEN, 1000000.0, self.device)
-
-        # Initialize kernel weights
-        self.kernel.init_ldg_layer_weights(
-            input_layernorm_weights, q_proj_weights, k_proj_weights, v_proj_weights,
-            q_norm_weights, k_norm_weights, o_proj_weights, post_attn_layernorm_weights,
-            gate_proj_weights, up_proj_weights, down_proj_weights,
-        )
-        self.kernel.init_ldg_embed_weight(embed_weight)
 
         # Allocate buffers
         HIGHPAR_NUM_BLOCKS = 1184
@@ -390,10 +421,52 @@ class MegakernelChat:
         self.block_max_vals = torch.zeros(HIGHPAR_NUM_BLOCKS, device=self.device, dtype=torch.float32)
         self.block_max_idxs = torch.zeros(HIGHPAR_NUM_BLOCKS, device=self.device, dtype=torch.int32)
 
-        print("Ready!")
+        initial_variant = self._select_kernel_variant(prompt_len=0, max_new_tokens=500)
+        self._get_or_compile_kernel(initial_variant)
+
+        print(f"Kernel selection mode: {self.kernel_variant_mode}")
+        print(f"Ready! (active decode kernel: {initial_variant})")
+
+    def _init_kernel_weights(self, kernel_module) -> None:
+        kernel_module.init_ldg_layer_weights(
+            self.input_layernorm_weights,
+            self.q_proj_weights,
+            self.k_proj_weights,
+            self.v_proj_weights,
+            self.q_norm_weights,
+            self.k_norm_weights,
+            self.o_proj_weights,
+            self.post_attn_layernorm_weights,
+            self.gate_proj_weights,
+            self.up_proj_weights,
+            self.down_proj_weights,
+        )
+        kernel_module.init_ldg_embed_weight(self.embed_weight)
+
+    def _select_kernel_variant(self, prompt_len: int, max_new_tokens: int) -> str:
+        del prompt_len
+        if self.kernel_variant_mode != AUTO_KERNEL_VARIANT:
+            return self.kernel_variant_mode
+        return select_optimal_kernel_variant(max_new_tokens)
+
+    def _get_or_compile_kernel(self, variant: str):
+        if variant in self._kernel_cache:
+            self.kernel = self._kernel_cache[variant]
+            self._active_kernel_variant = variant
+            return self.kernel
+
+        print(f"Compiling custom CUDA kernel variant: {variant}...")
+        kernel_module = compile_kernel(variant)
+        self._init_kernel_weights(kernel_module)
+        self._kernel_cache[variant] = kernel_module
+        self.kernel = kernel_module
+        self._active_kernel_variant = variant
+        return kernel_module
 
     def generate(self, prompt: str, max_new_tokens: int = 100, show_speed: bool = True) -> str:
         """Generate response using 100% custom CUDA kernels."""
+        if max_new_tokens <= 0:
+            raise ValueError("max_new_tokens must be positive")
 
         # Reset KV cache
         self.k_cache.zero_()
@@ -409,6 +482,9 @@ class MegakernelChat:
             input_ids = input_ids[-(MAX_SEQ_LEN - max_new_tokens - 1):]
             prompt_len = len(input_ids)
 
+        selected_variant = self._select_kernel_variant(prompt_len, max_new_tokens)
+        kernel = self._get_or_compile_kernel(selected_variant)
+
         total_start = time.perf_counter()
 
         # Sequential prefill using custom kernel (process each prompt token)
@@ -416,7 +492,7 @@ class MegakernelChat:
         first_generated_token = None
         for position, token_id in enumerate(input_ids):
             cache_len = position + 1
-            output_token = self.kernel.decode_ldg(
+            output_token = kernel.decode_ldg(
                 token_id,
                 self.final_norm_weight,
                 self.lm_head_weight,
@@ -454,7 +530,8 @@ class MegakernelChat:
             total_time = time.perf_counter() - total_start
             response = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
             if show_speed:
-                print(f"\n[prefill: {prompt_len} tok @ {prompt_len/prefill_time:.0f} tok/s | decode: 1 tok | total: {total_time*1000:.0f}ms]")
+                print(f"\n[kernel: {selected_variant} | prefill: {prompt_len} tok @ {prompt_len/prefill_time:.0f} tok/s | "
+                      f"decode: 1 tok | total: {total_time*1000:.0f}ms]")
             return response
 
         # Decode using custom kernel (continue from first generated token)
@@ -464,7 +541,7 @@ class MegakernelChat:
             position = prompt_len + i  # first_generated_token goes at position prompt_len
             cache_len = position + 1
 
-            next_token = self.kernel.decode_ldg(
+            next_token = kernel.decode_ldg(
                 current_token,
                 self.final_norm_weight,
                 self.lm_head_weight,
@@ -506,9 +583,7 @@ class MegakernelChat:
             num_generated = len(generated_tokens)
             prefill_tps = prompt_len / prefill_time if prefill_time > 0 else 0
             decode_tps = num_generated / decode_time if decode_time > 0 else 0
-            total_tokens = prompt_len + num_generated
-            overall_tps = total_tokens / total_time if total_time > 0 else 0
-            print(f"\n[prefill: {prompt_len} tok @ {prefill_tps:.0f} tok/s | "
+            print(f"\n[kernel: {selected_variant} | prefill: {prompt_len} tok @ {prefill_tps:.0f} tok/s | "
                   f"decode: {num_generated} tok @ {decode_tps:.0f} tok/s | "
                   f"total: {total_time*1000:.0f}ms]")
 
@@ -516,7 +591,8 @@ class MegakernelChat:
 
     def generate_stream(self, prompt: str, max_new_tokens: int = 500):
         """Generate response with streaming output."""
-        import sys
+        if max_new_tokens <= 0:
+            raise ValueError("max_new_tokens must be positive")
 
         # Reset KV cache
         self.k_cache.zero_()
@@ -531,6 +607,9 @@ class MegakernelChat:
             input_ids = input_ids[-(MAX_SEQ_LEN - max_new_tokens - 1):]
             prompt_len = len(input_ids)
 
+        selected_variant = self._select_kernel_variant(prompt_len, max_new_tokens)
+        kernel = self._get_or_compile_kernel(selected_variant)
+
         total_start = time.perf_counter()
 
         # Prefill
@@ -538,7 +617,7 @@ class MegakernelChat:
         first_generated_token = None
         for position, token_id in enumerate(input_ids):
             cache_len = position + 1
-            output_token = self.kernel.decode_ldg(
+            output_token = kernel.decode_ldg(
                 token_id,
                 self.final_norm_weight,
                 self.lm_head_weight,
@@ -574,7 +653,8 @@ class MegakernelChat:
 
         if current_token == self.tokenizer.eos_token_id:
             total_time = time.perf_counter() - total_start
-            print(f"\n[prefill: {prompt_len} tok @ {prompt_len/prefill_time:.0f} tok/s | decode: 1 tok | total: {total_time*1000:.0f}ms]")
+            print(f"\n[kernel: {selected_variant} | prefill: {prompt_len} tok @ {prompt_len/prefill_time:.0f} tok/s | "
+                  f"decode: 1 tok | total: {total_time*1000:.0f}ms]")
             return self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
 
         # Decode with streaming
@@ -584,7 +664,7 @@ class MegakernelChat:
             position = prompt_len + i
             cache_len = position + 1
 
-            next_token = self.kernel.decode_ldg(
+            next_token = kernel.decode_ldg(
                 current_token,
                 self.final_norm_weight,
                 self.lm_head_weight,
@@ -626,7 +706,7 @@ class MegakernelChat:
         num_generated = len(generated_tokens)
         prefill_tps = prompt_len / prefill_time if prefill_time > 0 else 0
         decode_tps = num_generated / decode_time if decode_time > 0 else 0
-        print(f"\n[prefill: {prompt_len} tok @ {prefill_tps:.0f} tok/s | "
+        print(f"\n[kernel: {selected_variant} | prefill: {prompt_len} tok @ {prefill_tps:.0f} tok/s | "
               f"decode: {num_generated} tok @ {decode_tps:.0f} tok/s | "
               f"total: {total_time*1000:.0f}ms]")
 

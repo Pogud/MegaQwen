@@ -373,7 +373,7 @@ def benchmark_llamacpp(monitor: PowerMonitor, ref_logits: torch.Tensor) -> Bench
         tok_per_joule = tokens / energy_joules if energy_joules > 0 else 0
 
         # Argmax check - get first predicted token
-        check_output = llm(TEST_PROMPT, max_tokens=1, temperature=0.0)
+        _ = llm(TEST_PROMPT, max_tokens=1, temperature=0.0)
         # llama.cpp doesn't easily expose token IDs, so we skip argmax match
 
         del llm

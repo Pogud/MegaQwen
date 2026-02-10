@@ -26,6 +26,14 @@ def _replace_text_once(source: str, old: str, new: str, label: str) -> str:
     return source.replace(old, new, 1)
 
 
+def _replace_text_all(source: str, old: str, new: str, label: str) -> str:
+    """Replace all exact text matches, failing if none are found."""
+    count = source.count(old)
+    if count < 1:
+        raise ValueError(f"failed to apply variant transform: {label}")
+    return source.replace(old, new)
+
+
 def _apply_fast_math(source: str) -> str:
     """Switch exp/silu hot paths to fast approximate PTX ops."""
     anchor = """__device__ __forceinline__ float ldg_warp_reduce_sum(float val) {
@@ -98,6 +106,26 @@ def _apply_qwen_macro_tuning(source: str, num_blocks: int, block_size: int) -> s
 
 def _apply_attention_prefetch(source: str) -> str:
     """Use idle decode blocks to prefetch O/Gate weights while attention runs."""
+    has_prefetch_signature = (
+        "const __nv_bfloat16* __restrict__ o_weight" in source
+        and "const __nv_bfloat16* __restrict__ gate_weight" in source
+    )
+    if has_prefetch_signature:
+        if "LDG_PREFETCH_BYTES_PER_IDLE_BLOCK" not in source:
+            # Newer baselines already have prefetch signatures but use different constants.
+            pattern = (
+                r"(__device__ void ldg_attention\([\s\S]*?\)\s*\{\n"
+                r"\s*int block_id = blockIdx\.x;\n"
+                r"\s*int num_blocks = gridDim\.x;\n"
+                r"\s*int warp_id = threadIdx\.x / WARP_SIZE;\n"
+                r"\s*int lane_id = threadIdx\.x % WARP_SIZE;\n)"
+            )
+            replacement = r"\1\n    constexpr int LDG_PREFETCH_BYTES_PER_IDLE_BLOCK = 32768;\n"
+            source, count = re.subn(pattern, replacement, source, count=1)
+            if count != 1:
+                raise ValueError("failed to apply variant transform: attn_prefetch_constant")
+        return source
+
     old_sig = """__device__ void ldg_attention(
     cg::grid_group& grid,
     const float* __restrict__ q,
@@ -330,7 +358,7 @@ def _apply_uint4_weights(source: str) -> str:
         "uint4_down_proj",
     )
 
-    source = _replace_text_once(
+    source = _replace_text_all(
         source,
         """        float sum = 0.0f;
         #pragma unroll 8
